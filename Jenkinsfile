@@ -1,254 +1,260 @@
 pipeline {
     agent any
-    
+
     environment {
-        PYTHON_IMAGE = 'python:3.9-slim'
-        IMAGE_NAME = 'devsecops-project'
-        TRIVY_IMAGE = 'aquasec/trivy:latest'
-        COMPOSE_PROJECT_NAME = 'jenkins-devsecops-ecommerce'
-        APP_PORT = '5001'
+        PYTHON_IMAGE = 'python:3.12-slim'
+        IMAGE_NAME = 'arithmetic-app'
+        APP_DIR = 'ArithmeticApp'
     }
-    
+
+    triggers {
+        pollSCM('H/5 * * * *')  // checks every 5 minutes for new commits
+    }
+
     stages {
         stage('Checkout') {
             steps {
+                echo '📦 Checking out source code...'
                 checkout scm
             }
         }
-        
-        // --- Run Python steps on main agent ---
-        stage('Setup Python Environment') {
-            steps {
-                sh '''
-                    python3 -m venv venv
-                    . venv/bin/activate
-                    pip install --upgrade pip
-                    pip install -r requirements.txt
-                '''
-            }
-        }
-        
-        stage('Run Tests') {
-            steps {
-                sh '''
-                    . venv/bin/activate
-                    pytest --junitxml=test-results.xml -v || true
-                '''
-            }
-            post {
-                always {
-                    junit allowEmptyResults: true, testResults: 'test-results.xml'
-                }
-            }
-        }
-        
-        stage('Static Code Analysis (Bandit)') {
-            steps {
-                sh '''
-                    . venv/bin/activate
-                    bandit -r . -f json -o bandit-report.json || true
-                    echo "=== Bandit Security Scan Results ==="
-                    bandit -r . || true
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
-                }
-            }
-        }
-        
-        stage('Check Dependency Vulnerabilities (Safety)') {
-            steps {
-                sh '''
-                    . venv/bin/activate
-                    safety check --json --output safety-report.json || true
-                    echo "=== Safety Dependency Check Results ==="
-                    safety check || true
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'safety-report.json', allowEmptyArchive: true
-                }
-            }
-        }
-        
-        // --- Cleanup existing Jenkins deployment ---
-        stage('Cleanup Previous Deployment') {
+
+        stage('Install Dependencies') {
             steps {
                 script {
-                    echo "Stopping previous Jenkins deployment..."
+                    echo '⚙️ Setting up virtual environment with cached dependencies...'
                     sh '''
-                        docker-compose -p ${COMPOSE_PROJECT_NAME} down || true
-                        
-                        # Stop any container using our target port
-                        CONTAINER_ON_PORT=$(docker ps --filter "publish=${APP_PORT}" -q)
-                        if [ ! -z "$CONTAINER_ON_PORT" ]; then
-                            echo "Stopping container on port ${APP_PORT}"
-                            docker stop $CONTAINER_ON_PORT || true
-                            docker rm $CONTAINER_ON_PORT || true
+                        cd ${APP_DIR}
+
+                        mkdir -p $HOME/.cache/pip
+
+                        if [ ! -d "venv" ]; then
+                            python3 -m venv venv
                         fi
+
+                        . venv/bin/activate
+
+                        pip install --upgrade pip
+
+                        pip install --cache-dir $HOME/.cache/pip -r requirements.txt bandit safety pytest
                     '''
                 }
             }
         }
-        
-        // --- Build Docker Image ---
+
+        stage('Run Tests') {
+            steps {
+                script {
+                    echo '🧪 Running tests...'
+                    sh '''
+                        cd ${APP_DIR}
+                        . venv/bin/activate
+                        pytest
+                    '''
+                }
+            }
+        }
+
+        stage('Static Code Analysis (Bandit)') {
+            steps {
+                script {
+                    echo '🔍 Running Bandit security scan...'
+                    sh '''
+                        cd ${APP_DIR}
+                        . venv/bin/activate
+                        REPORT_NAME="bandit-report-build-${BUILD_NUMBER}.json"
+
+                        echo "📊 Running fail-fast Bandit scan (High severity)..."
+                        # 🚨 Fail build only if HIGH severity found
+                        bandit -r . --configfile bandit.yaml --severity-level high
+
+                        echo "💾 Generating full Bandit report (all severities)..."
+                        # 🧾 This one must NOT fail the build
+                        bandit -r . --configfile bandit.yaml \
+                               --severity-level low \
+                               --format json | tee "$REPORT_NAME" || true
+
+                        echo "🧾 Bandit JSON report saved as: $REPORT_NAME"
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${APP_DIR}/bandit-report-build-*.json", allowEmptyArchive: true
+                }
+                failure {
+                    echo '🚨 Bandit found high-severity issues — build failed.'
+                }
+            }
+        }
+
+
+
+
+
+        stage('Dependency Vulnerability Scan (Safety)') {
+            environment {
+                SAFETY_API_KEY = credentials('SAFETY_API_KEY')
+            }
+            steps {
+                script {
+                    echo '🔒 Running Safety dependency vulnerability scan...'
+                    sh '''
+                        cd ${APP_DIR}
+                        . venv/bin/activate
+
+                        REPORT_NAME="safety-report-build-${BUILD_NUMBER}.json"
+                        echo "📄 Generating Safety report: $REPORT_NAME"
+
+                        # Fail build on HIGH or CRITICAL vulnerabilities
+                        safety scan -r requirements.txt --json --fail-on-severity high | tee "$REPORT_NAME"
+
+                        echo "🧾 Safety JSON report saved as: $REPORT_NAME"
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${APP_DIR}/safety-report-build-*.json", allowEmptyArchive: true
+                }
+                failure {
+                    echo '🚨 Safety scan detected high-severity dependency vulnerabilities. Build stopped.'
+                }
+            }
+        }
+
+
         stage('Build Docker Image') {
             steps {
                 script {
-                    echo "Building Docker image..."
+                    echo '🐳 Building Docker image...'
                     sh '''
-                        docker build -t ${IMAGE_NAME}:latest .
-                        docker tag ${IMAGE_NAME}:latest ${IMAGE_NAME}:${BUILD_NUMBER}
-                        echo "Image built: ${IMAGE_NAME}:latest"
-                        echo "Image tagged: ${IMAGE_NAME}:${BUILD_NUMBER}"
+                        cd ${APP_DIR}
+
+                        # Define image name and tags
+                        IMAGE_NAME="arithmetic-app"
+                        BUILD_TAG="build-${BUILD_NUMBER}"
+
+                        echo "🏷️ Building ${IMAGE_NAME}:${BUILD_TAG} ..."
+                        docker build -t ${IMAGE_NAME}:${BUILD_TAG} \
+                                     -t ${IMAGE_NAME}:latest \
+                                     --label "jenkins_build=${BUILD_NUMBER}" \
+                                     --label "build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+                                     .
+
+                        echo "✅ Image built successfully: ${IMAGE_NAME}:${BUILD_TAG}"
+                        docker images ${IMAGE_NAME}
                     '''
                 }
             }
         }
-        
-        // --- Scan with Trivy ---
-        stage('Container Vulnerability Scan (Trivy)') {
-            steps {
-                script {
-                    echo "Scanning image with Trivy..."
-                    sh '''
-                        # Run Trivy scan
-                        docker run --rm \
-                            -v /var/run/docker.sock:/var/run/docker.sock \
-                            -v $(pwd):/output \
-                            ${TRIVY_IMAGE} image \
-                            --severity HIGH,CRITICAL \
-                            --format json \
-                            --output /output/trivy-report.json \
-                            ${IMAGE_NAME}:latest || true
-                        
-                        # Show summary in console
-                        echo "=== Trivy Vulnerability Scan Results ==="
-                        docker run --rm \
-                            -v /var/run/docker.sock:/var/run/docker.sock \
-                            ${TRIVY_IMAGE} image \
-                            --severity HIGH,CRITICAL \
-                            ${IMAGE_NAME}:latest || true
-                    '''
-                }
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
-                }
-            }
-        }
-        
-        // --- Deploy Application ---
+
+
+stage('Container Vulnerability Scan (Trivy)') {
+  environment {
+    TRIVY_SEVERITY = 'CRITICAL,HIGH,MEDIUM,LOW'
+  }
+  steps {
+    script {
+      sh '''
+        set -e
+        FULL_IMAGE="${IMAGE_NAME}:build-${BUILD_NUMBER}"
+        REPORT_NAME="trivy-report-${BUILD_NUMBER}"
+        CACHE_DIR="${WORKSPACE}/.trivy-cache"
+
+        echo "🔍 Full Trivy scan for ${FULL_IMAGE}"
+        mkdir -p "${CACHE_DIR}"
+
+        # Single scan: show table in console, save both table & JSON
+        docker run --rm \
+          -e TRIVY_LOG_LEVEL=ERROR \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v "${CACHE_DIR}:/root/.cache/" \
+          -v "${WORKSPACE}:/workspace" \
+          aquasec/trivy image \
+          --quiet --no-progress \
+          --ignore-unfixed \
+          --scanners vuln \
+          --severity "${TRIVY_SEVERITY}" \
+          --exit-code 0 \
+          --format table \
+          "${FULL_IMAGE}" | tee "${WORKSPACE}/${REPORT_NAME}.txt"
+
+        docker run --rm \
+          -e TRIVY_LOG_LEVEL=ERROR \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v "${CACHE_DIR}:/root/.cache/" \
+          -v "${WORKSPACE}:/workspace" \
+          aquasec/trivy image \
+          --quiet --no-progress \
+          --ignore-unfixed \
+          --scanners vuln \
+          --severity "${TRIVY_SEVERITY}" \
+          --exit-code 0 \
+          --format json \
+          -o "/workspace/${REPORT_NAME}.json" \
+          "${FULL_IMAGE}"
+
+        echo "🚨 Checking saved report for HIGH or CRITICAL findings..."
+        if grep -E '"Severity": "(HIGH|CRITICAL)"' "${WORKSPACE}/${REPORT_NAME}.json" >/dev/null; then
+          echo "❌ HIGH/CRITICAL vulnerabilities detected!"
+          exit 1
+        else
+          echo "✅ No HIGH/CRITICAL issues found — continuing..."
+        fi
+      '''
+    }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'trivy-report-*.{json,txt}', allowEmptyArchive: true
+    }
+    failure {
+      echo '🚨 Build failed: HIGH or CRITICAL vulnerabilities detected'
+    }
+  }
+}
+
+
+
         stage('Deploy Application') {
             steps {
                 script {
-                    echo "Deploying E-Commerce API on port ${APP_PORT}..."
+                    echo '🚀 Deploying Flask app using Docker Compose...'
                     sh '''
-                        # Create a temporary docker-compose file with custom port
-                        cat > docker-compose.jenkins.yml <<EOF
-version: '3.8'
-services:
-  web:
-    image: ${IMAGE_NAME}:latest
-    container_name: ${COMPOSE_PROJECT_NAME}-api
-    ports:
-      - "${APP_PORT}:5000"
-    environment:
-      - FLASK_ENV=production
-    restart: unless-stopped
-EOF
-                        
-                        # Deploy using the custom compose file
-                        docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} up -d
-                        
-                        echo "Deployment complete!"
-                    '''
-                }
-            }
-        }
-        
-        // --- Verify Deployment ---
-        stage('Verify Deployment') {
-            steps {
-                script {
-                    echo "Verifying E-Commerce API deployment..."
-                    sh '''
-                        echo "Waiting for application to start..."
-                        sleep 10
-                        
-                        # Check if container is running
-                        echo "=== Container Status ==="
-                        docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} ps
-                        
-                        # Check container logs
-                        echo "=== Container Logs ==="
-                        docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} logs --tail=30
-                        
-                        # Test the application endpoints
-                        echo "=== Testing Application Endpoints ==="
-                        
-                        echo "Testing home endpoint..."
-                        curl -f http://localhost:${APP_PORT}/ && echo "✅ Home endpoint OK" || echo "⚠️  Home endpoint failed"
-                        
-                        echo "Testing health endpoint..."
-                        curl -f http://localhost:${APP_PORT}/health && echo "✅ Health endpoint OK" || echo "⚠️  Health endpoint failed"
-                        
-                        echo "Testing products endpoint..."
-                        curl -f http://localhost:${APP_PORT}/products && echo "✅ Products endpoint OK" || echo "⚠️  Products endpoint failed"
-                        
-                        echo "Testing categories endpoint..."
-                        curl -f http://localhost:${APP_PORT}/categories && echo "✅ Categories endpoint OK" || echo "⚠️  Categories endpoint failed"
-                        
-                        echo "Testing stats endpoint..."
-                        curl -f http://localhost:${APP_PORT}/stats && echo "✅ Stats endpoint OK" || echo "⚠️  Stats endpoint failed"
+                        cd ${APP_DIR}
+
+                        IMAGE_NAME="arithmetic-app"
+                        BUILD_TAG="build-${BUILD_NUMBER}"
+
+                        echo "🧩 Deploying image: ${IMAGE_NAME}:${BUILD_TAG}"
+
+                        # Make sure the latest tag also points to this build
+                        docker tag ${IMAGE_NAME}:${BUILD_TAG} ${IMAGE_NAME}:latest
+
+                        # Bring down any running containers
+                        docker-compose down
+
+                        # Update the image tag dynamically in the compose file
+                        sed -i "s|image: ${IMAGE_NAME}:.*|image: ${IMAGE_NAME}:${BUILD_TAG}|g" docker-compose.yml
+
+                        # Start fresh with the new image
+                        docker-compose up -d --force-recreate
+
+                        echo "✅ Deployment complete. Running containers:"
+                        docker ps --filter "ancestor=${IMAGE_NAME}:${BUILD_TAG}"
                     '''
                 }
             }
         }
     }
-    
-    // --- Post-build actions ---
-    post {
-        always {
-            script {
-                echo "==================================="
-                echo "Pipeline Status: ${currentBuild.result}"
-                echo "Build Number: ${BUILD_NUMBER}"
-                echo "==================================="
-            }
-        }
-        success {
-            script {
-                echo "✅ E-Commerce API Pipeline completed successfully!"
-                echo "📦 Image built: ${IMAGE_NAME}:${BUILD_NUMBER}"
-                echo "🚀 Application deployed at: http://localhost:${APP_PORT}"
-                echo ""
-                echo "📋 API Documentation: http://localhost:${APP_PORT}/"
-                echo "❤️  Health Check: http://localhost:${APP_PORT}/health"
-                echo "📦 Products API: http://localhost:${APP_PORT}/products"
-                echo "📊 Statistics: http://localhost:${APP_PORT}/stats"
-                echo "🏷️  Categories: http://localhost:${APP_PORT}/categories"
-                echo ""
-                echo "Your manual deployment (if any) is still running on port 5000"
-            }
-        }
-        failure {
-            script {
-                echo "❌ Pipeline failed! Cleaning up..."
-                sh '''
-                    docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} down || true
-                '''
-            }
-        }
-        cleanup {
-            script {
-                echo "🧹 Cleaning workspace..."
-                cleanWs(deleteDirs: true, patterns: [[pattern: 'venv/**', type: 'INCLUDE']])
-            }
-        }
-    }
+
+post {
+  always {
+    sh 'mkdir -p archived && mv trivy-report-* bandit-report-* safety-report-* archived/ || true'
+    archiveArtifacts artifacts: 'archived/**'
+    cleanWs()
+  }
+}
+
 }
