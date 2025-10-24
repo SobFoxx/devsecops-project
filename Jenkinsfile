@@ -6,7 +6,7 @@ pipeline {
         IMAGE_NAME = 'devsecops-project'
         TRIVY_IMAGE = 'aquasec/trivy:latest'
         COMPOSE_PROJECT_NAME = 'jenkins-devsecops-ecommerce'
-        APP_PORT = '5001'  // Different port to avoid conflict with manual deployment
+        APP_PORT = '5001'
     }
     
     stages {
@@ -16,68 +16,60 @@ pipeline {
             }
         }
         
-        // --- Run all Python steps inside a Python container ---
-        stage('Run Python Analysis & Tests') {
-            agent {
-                dockerContainer { 
-                    image env.PYTHON_IMAGE
-                    args '-v $WORKSPACE:/workspace -w /workspace'
+        // --- Run Python steps on main agent ---
+        stage('Setup Python Environment') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pytest --junitxml=test-results.xml -v || true
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results.xml'
                 }
             }
-            stages {
-                stage('Install Dependencies') {
-                    steps {
-                        sh '''
-                            python3 -m venv venv
-                            . venv/bin/activate
-                            pip install --upgrade pip
-                            pip install -r requirements.txt
-                        '''
-                    }
+        }
+        
+        stage('Static Code Analysis (Bandit)') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    bandit -r . -f json -o bandit-report.json || true
+                    echo "=== Bandit Security Scan Results ==="
+                    bandit -r . || true
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
                 }
-                
-                stage('Run Tests') {
-                    steps {
-                        sh '''
-                            . venv/bin/activate
-                            pytest --junitxml=test-results.xml -v || true
-                        '''
-                    }
-                    post {
-                        always {
-                            junit allowEmptyResults: true, testResults: 'test-results.xml'
-                        }
-                    }
-                }
-                
-                stage('Static Code Analysis (Bandit)') {
-                    steps {
-                        sh '''
-                            . venv/bin/activate
-                            bandit -r . -f json -o bandit-report.json || true
-                            bandit -r . || true
-                        '''
-                    }
-                    post {
-                        always {
-                            archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
-                        }
-                    }
-                }
-                
-                stage('Check Dependency Vulnerabilities (Safety)') {
-                    steps {
-                        sh '''
-                            . venv/bin/activate
-                            safety check --json --output safety-report.json || true
-                            safety check || true
-                        '''
-                    }
-                    post {
-                        always {
-                            archiveArtifacts artifacts: 'safety-report.json', allowEmptyArchive: true
-                        }
-                    }
+            }
+        }
+        
+        stage('Check Dependency Vulnerabilities (Safety)') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    safety check --json --output safety-report.json || true
+                    echo "=== Safety Dependency Check Results ==="
+                    safety check || true
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'safety-report.json', allowEmptyArchive: true
                 }
             }
         }
@@ -110,30 +102,38 @@ pipeline {
                     sh '''
                         docker build -t ${IMAGE_NAME}:latest .
                         docker tag ${IMAGE_NAME}:latest ${IMAGE_NAME}:${BUILD_NUMBER}
+                        echo "Image built: ${IMAGE_NAME}:latest"
+                        echo "Image tagged: ${IMAGE_NAME}:${BUILD_NUMBER}"
                     '''
                 }
             }
         }
         
-        // --- Scan the image using Trivy ---
+        // --- Scan with Trivy ---
         stage('Container Vulnerability Scan (Trivy)') {
-            agent {
-                dockerContainer { 
-                    image env.TRIVY_IMAGE
-                    args '-v /var/run/docker.sock:/var/run/docker.sock'
-                }
-            }
             steps {
-                sh '''
-                    trivy image --severity HIGH,CRITICAL \
-                        --format json \
-                        --output trivy-report.json \
-                        ${IMAGE_NAME}:latest || true
-                    
-                    # Also show summary in console
-                    echo "=== Trivy Vulnerability Scan Results ==="
-                    trivy image --severity HIGH,CRITICAL ${IMAGE_NAME}:latest || true
-                '''
+                script {
+                    echo "Scanning image with Trivy..."
+                    sh '''
+                        # Run Trivy scan
+                        docker run --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v $(pwd):/output \
+                            ${TRIVY_IMAGE} image \
+                            --severity HIGH,CRITICAL \
+                            --format json \
+                            --output /output/trivy-report.json \
+                            ${IMAGE_NAME}:latest || true
+                        
+                        # Show summary in console
+                        echo "=== Trivy Vulnerability Scan Results ==="
+                        docker run --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            ${TRIVY_IMAGE} image \
+                            --severity HIGH,CRITICAL \
+                            ${IMAGE_NAME}:latest || true
+                    '''
+                }
             }
             post {
                 always {
@@ -164,6 +164,8 @@ EOF
                         
                         # Deploy using the custom compose file
                         docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} up -d
+                        
+                        echo "Deployment complete!"
                     '''
                 }
             }
@@ -188,8 +190,9 @@ EOF
                         
                         # Test the application endpoints
                         echo "=== Testing Application Endpoints ==="
+                        
                         echo "Testing home endpoint..."
-                        curl -f http://localhost:${APP_PORT} && echo "✅ Home endpoint OK" || echo "⚠️  Home endpoint failed"
+                        curl -f http://localhost:${APP_PORT}/ && echo "✅ Home endpoint OK" || echo "⚠️  Home endpoint failed"
                         
                         echo "Testing health endpoint..."
                         curl -f http://localhost:${APP_PORT}/health && echo "✅ Health endpoint OK" || echo "⚠️  Health endpoint failed"
@@ -199,6 +202,9 @@ EOF
                         
                         echo "Testing categories endpoint..."
                         curl -f http://localhost:${APP_PORT}/categories && echo "✅ Categories endpoint OK" || echo "⚠️  Categories endpoint failed"
+                        
+                        echo "Testing stats endpoint..."
+                        curl -f http://localhost:${APP_PORT}/stats && echo "✅ Stats endpoint OK" || echo "⚠️  Stats endpoint failed"
                     '''
                 }
             }
@@ -220,10 +226,12 @@ EOF
                 echo "✅ E-Commerce API Pipeline completed successfully!"
                 echo "📦 Image built: ${IMAGE_NAME}:${BUILD_NUMBER}"
                 echo "🚀 Application deployed at: http://localhost:${APP_PORT}"
-                echo "📋 API Documentation: http://localhost:${APP_PORT}"
+                echo ""
+                echo "📋 API Documentation: http://localhost:${APP_PORT}/"
                 echo "❤️  Health Check: http://localhost:${APP_PORT}/health"
                 echo "📦 Products API: http://localhost:${APP_PORT}/products"
                 echo "📊 Statistics: http://localhost:${APP_PORT}/stats"
+                echo "🏷️  Categories: http://localhost:${APP_PORT}/categories"
                 echo ""
                 echo "Your manual deployment (if any) is still running on port 5000"
             }
