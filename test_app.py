@@ -1,6 +1,9 @@
 import pytest
-from app import app, products, categories
+from app import app
 import json
+
+# Import products and task_id_counter from app module
+import app as app_module
 
 @pytest.fixture
 def client():
@@ -11,9 +14,9 @@ def client():
 @pytest.fixture(autouse=True)
 def reset_products():
     """Reset products to initial state before each test"""
-    global products
-    products.clear()
-    products.extend([
+    # Reset the products list in the app module
+    app_module.products.clear()
+    app_module.products.extend([
         {
             "id": 1,
             "name": "Laptop Pro 15",
@@ -35,7 +38,34 @@ def reset_products():
             "created_at": "2024-02-20"
         }
     ])
+    # Reset the counter
+    app_module.product_id_counter = 3
     yield
+    # Clean up after test
+    app_module.products.clear()
+    app_module.products.extend([
+        {
+            "id": 1,
+            "name": "Laptop Pro 15",
+            "category": "Electronics",
+            "price": 1299.99,
+            "stock": 45,
+            "description": "High-performance laptop with 16GB RAM and 512GB SSD",
+            "rating": 4.5,
+            "created_at": "2024-01-15"
+        },
+        {
+            "id": 2,
+            "name": "Wireless Mouse",
+            "category": "Accessories",
+            "price": 29.99,
+            "stock": 150,
+            "description": "Ergonomic wireless mouse with USB receiver",
+            "rating": 4.2,
+            "created_at": "2024-02-20"
+        }
+    ])
+    app_module.product_id_counter = 3
 
 # ============ HOME & HEALTH TESTS ============
 

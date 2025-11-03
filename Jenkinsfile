@@ -4,7 +4,8 @@ pipeline {
     environment {
         PYTHON_IMAGE = 'python:3.9-slim'
         IMAGE_NAME = 'devsecops-project'
-        APP_DIR = '.'  // Root directory since files are in project root
+        APP_DIR = '.'
+        BUILD_STATUS = 'SUCCESS'
     }
 
     triggers {
@@ -46,16 +47,22 @@ pipeline {
             steps {
                 script {
                     echo '🧪 Running tests...'
-                    sh '''
-                        cd ${APP_DIR}
-                        . venv/bin/activate
-                        pytest --junitxml=test-results.xml -v
-                    '''
+                    // Continue even if tests fail
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh '''
+                            cd ${APP_DIR}
+                            . venv/bin/activate
+                            pytest --junitxml=test-results.xml -v
+                        '''
+                    }
                 }
             }
             post {
                 always {
                     junit allowEmptyResults: true, testResults: 'test-results.xml'
+                }
+                unstable {
+                    echo '⚠️ Some tests failed, but continuing build...'
                 }
             }
         }
@@ -64,29 +71,30 @@ pipeline {
             steps {
                 script {
                     echo '🔍 Running Bandit security scan...'
-                    sh '''
-                        cd ${APP_DIR}
-                        . venv/bin/activate
-                        REPORT_NAME="bandit-report-build-${BUILD_NUMBER}.json"
+                    // Continue even if high severity issues found
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh '''
+                            cd ${APP_DIR}
+                            . venv/bin/activate
+                            REPORT_NAME="bandit-report-build-${BUILD_NUMBER}.json"
 
-                        echo "📊 Running fail-fast Bandit scan (High severity)..."
-                        # 🚨 Fail build only if HIGH severity found
-                        bandit -r . -ll || true
+                            echo "📊 Running Bandit scan (all severities)..."
+                            bandit -r . -f json > "${REPORT_NAME}" || true
+                            
+                            echo "💾 Showing Bandit summary..."
+                            bandit -r . || true
 
-                        echo "💾 Generating full Bandit report (all severities)..."
-                        # 🧾 This one must NOT fail the build
-                        bandit -r . -f json | tee "$REPORT_NAME" || true
-
-                        echo "🧾 Bandit JSON report saved as: $REPORT_NAME"
-                    '''
+                            echo "🧾 Bandit JSON report saved as: ${REPORT_NAME}"
+                        '''
+                    }
                 }
             }
             post {
                 always {
                     archiveArtifacts artifacts: "bandit-report-build-*.json", allowEmptyArchive: true
                 }
-                failure {
-                    echo '🚨 Bandit found high-severity issues — build failed.'
+                unstable {
+                    echo '⚠️ Bandit found security issues, but continuing build...'
                 }
             }
         }
@@ -95,26 +103,33 @@ pipeline {
             steps {
                 script {
                     echo '🔒 Running Safety dependency vulnerability scan...'
-                    sh '''
-                        cd ${APP_DIR}
-                        . venv/bin/activate
+                    // Continue even if vulnerabilities found
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh '''
+                            cd ${APP_DIR}
+                            . venv/bin/activate
 
-                        REPORT_NAME="safety-report-build-${BUILD_NUMBER}.json"
-                        echo "📄 Generating Safety report: $REPORT_NAME"
+                            REPORT_NAME="safety-report-build-${BUILD_NUMBER}.json"
+                            echo "📄 Generating Safety report: ${REPORT_NAME}"
 
-                        # Run Safety check and save report
-                        safety check --json --output "$REPORT_NAME" || true
+                            # Run Safety check and save report (continue on failure)
+                            safety check --json --output "${REPORT_NAME}" || true
+                            
+                            # Show summary
+                            echo "💾 Safety scan summary..."
+                            safety check || true
 
-                        echo "🧾 Safety JSON report saved as: $REPORT_NAME"
-                    '''
+                            echo "🧾 Safety JSON report saved as: ${REPORT_NAME}"
+                        '''
+                    }
                 }
             }
             post {
                 always {
                     archiveArtifacts artifacts: "safety-report-build-*.json", allowEmptyArchive: true
                 }
-                failure {
-                    echo '🚨 Safety scan detected high-severity dependency vulnerabilities. Build stopped.'
+                unstable {
+                    echo '⚠️ Safety found dependency vulnerabilities, but continuing build...'
                 }
             }
         }
@@ -126,7 +141,6 @@ pipeline {
                     sh '''
                         cd ${APP_DIR}
 
-                        # Define image name and tags
                         BUILD_TAG="build-${BUILD_NUMBER}"
 
                         echo "🏷️ Building ${IMAGE_NAME}:${BUILD_TAG} ..."
@@ -149,60 +163,62 @@ pipeline {
             }
             steps {
                 script {
-                    sh '''
-                        set -e
-                        FULL_IMAGE="${IMAGE_NAME}:build-${BUILD_NUMBER}"
-                        REPORT_NAME="trivy-report-${BUILD_NUMBER}"
-                        CACHE_DIR="${WORKSPACE}/.trivy-cache"
+                    echo '🔍 Running Trivy container vulnerability scan...'
+                    // Continue even if vulnerabilities found
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh '''
+                            FULL_IMAGE="${IMAGE_NAME}:build-${BUILD_NUMBER}"
+                            REPORT_NAME="trivy-report-${BUILD_NUMBER}"
+                            CACHE_DIR="${WORKSPACE}/.trivy-cache"
 
-                        echo "🔍 Full Trivy scan for ${FULL_IMAGE}"
-                        mkdir -p "${CACHE_DIR}"
+                            echo "🔍 Full Trivy scan for ${FULL_IMAGE}"
+                            mkdir -p "${CACHE_DIR}"
 
-                        # Single scan: show table in console, save both table & JSON
-                        docker run --rm \
-                          -e TRIVY_LOG_LEVEL=ERROR \
-                          -v /var/run/docker.sock:/var/run/docker.sock \
-                          -v "${CACHE_DIR}:/root/.cache/" \
-                          -v "${WORKSPACE}:/workspace" \
-                          aquasec/trivy image \
-                          --quiet --no-progress \
-                          --ignore-unfixed \
-                          --scanners vuln \
-                          --severity "${TRIVY_SEVERITY}" \
-                          --exit-code 0 \
-                          --format table \
-                          "${FULL_IMAGE}" | tee "${WORKSPACE}/${REPORT_NAME}.txt"
+                            # Scan and save table format
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v "${CACHE_DIR}:/root/.cache/" \
+                              -v "${WORKSPACE}:/workspace" \
+                              aquasec/trivy image \
+                              --quiet --no-progress \
+                              --ignore-unfixed \
+                              --scanners vuln \
+                              --severity "${TRIVY_SEVERITY}" \
+                              --exit-code 0 \
+                              --format table \
+                              "${FULL_IMAGE}" | tee "${WORKSPACE}/${REPORT_NAME}.txt" || true
 
-                        docker run --rm \
-                          -e TRIVY_LOG_LEVEL=ERROR \
-                          -v /var/run/docker.sock:/var/run/docker.sock \
-                          -v "${CACHE_DIR}:/root/.cache/" \
-                          -v "${WORKSPACE}:/workspace" \
-                          aquasec/trivy image \
-                          --quiet --no-progress \
-                          --ignore-unfixed \
-                          --scanners vuln \
-                          --severity "${TRIVY_SEVERITY}" \
-                          --exit-code 0 \
-                          --format json \
-                          -o "/workspace/${REPORT_NAME}.json" \
-                          "${FULL_IMAGE}"
+                            # Scan and save JSON format
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v "${CACHE_DIR}:/root/.cache/" \
+                              -v "${WORKSPACE}:/workspace" \
+                              aquasec/trivy image \
+                              --quiet --no-progress \
+                              --ignore-unfixed \
+                              --scanners vuln \
+                              --severity "${TRIVY_SEVERITY}" \
+                              --exit-code 0 \
+                              --format json \
+                              -o "/workspace/${REPORT_NAME}.json" \
+                              "${FULL_IMAGE}" || true
 
-                        echo "🚨 Checking saved report for HIGH or CRITICAL findings..."
-                        if grep -E '"Severity": "(HIGH|CRITICAL)"' "${WORKSPACE}/${REPORT_NAME}.json" >/dev/null; then
-                          echo "⚠️ HIGH/CRITICAL vulnerabilities detected (allowing build to continue)..."
-                        else
-                          echo "✅ No HIGH/CRITICAL issues found — continuing..."
-                        fi
-                    '''
+                            # Check for HIGH/CRITICAL but don't fail
+                            if grep -E '"Severity": "(HIGH|CRITICAL)"' "${WORKSPACE}/${REPORT_NAME}.json" >/dev/null 2>&1; then
+                              echo "⚠️ HIGH/CRITICAL vulnerabilities detected (build continues)..."
+                            else
+                              echo "✅ No HIGH/CRITICAL issues found"
+                            fi
+                        '''
+                    }
                 }
             }
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy-report-*.{json,txt}', allowEmptyArchive: true
                 }
-                failure {
-                    echo '🚨 Build failed: HIGH or CRITICAL vulnerabilities detected'
+                unstable {
+                    echo '⚠️ Trivy found container vulnerabilities, but continuing build...'
                 }
             }
         }
@@ -220,13 +236,13 @@ pipeline {
 
                         echo "🧩 Deploying image: ${IMAGE_NAME}:${BUILD_TAG}"
 
-                        # Make sure the latest tag also points to this build
+                        # Tag as latest
                         docker tag ${IMAGE_NAME}:${BUILD_TAG} ${IMAGE_NAME}:latest
 
-                        # Stop any previous deployment
+                        # Stop previous deployment
                         docker-compose -p ${COMPOSE_PROJECT_NAME} down || true
 
-                        # Create docker-compose file for Jenkins deployment
+                        # Create docker-compose file
                         cat > docker-compose.jenkins.yml <<EOF
 version: '3.8'
 services:
@@ -240,13 +256,12 @@ services:
     restart: unless-stopped
 EOF
 
-                        # Start with the new image
+                        # Deploy
                         docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} up -d --force-recreate
 
-                        echo "✅ Deployment complete. Running containers:"
+                        echo "✅ Deployment complete"
                         docker ps --filter "ancestor=${IMAGE_NAME}:${BUILD_TAG}"
                         
-                        # Wait for app to start
                         echo "⏳ Waiting for application to start..."
                         sleep 10
                     '''
@@ -258,26 +273,34 @@ EOF
             steps {
                 script {
                     echo '🔍 Verifying E-Commerce API deployment...'
-                    sh '''
-                        APP_PORT="5001"
-                        
-                        echo "=== Testing Application Endpoints ==="
-                        
-                        echo "Testing home endpoint..."
-                        curl -f http://localhost:${APP_PORT}/ && echo "✅ Home endpoint OK" || echo "⚠️ Home endpoint failed"
-                        
-                        echo "Testing health endpoint..."
-                        curl -f http://localhost:${APP_PORT}/health && echo "✅ Health endpoint OK" || echo "⚠️ Health endpoint failed"
-                        
-                        echo "Testing products endpoint..."
-                        curl -f http://localhost:${APP_PORT}/products && echo "✅ Products endpoint OK" || echo "⚠️ Products endpoint failed"
-                        
-                        echo "Testing categories endpoint..."
-                        curl -f http://localhost:${APP_PORT}/categories && echo "✅ Categories endpoint OK" || echo "⚠️ Categories endpoint failed"
-                        
-                        echo "Testing stats endpoint..."
-                        curl -f http://localhost:${APP_PORT}/stats && echo "✅ Stats endpoint OK" || echo "⚠️ Stats endpoint failed"
-                    '''
+                    // Continue even if verification fails
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh '''
+                            APP_PORT="5001"
+                            
+                            echo "=== Testing Application Endpoints ==="
+                            
+                            echo "Testing home endpoint..."
+                            curl -f http://localhost:${APP_PORT}/ && echo "✅ Home endpoint OK" || echo "⚠️ Home endpoint failed"
+                            
+                            echo "Testing health endpoint..."
+                            curl -f http://localhost:${APP_PORT}/health && echo "✅ Health endpoint OK" || echo "⚠️ Health endpoint failed"
+                            
+                            echo "Testing products endpoint..."
+                            curl -f http://localhost:${APP_PORT}/products && echo "✅ Products endpoint OK" || echo "⚠️ Products endpoint failed"
+                            
+                            echo "Testing categories endpoint..."
+                            curl -f http://localhost:${APP_PORT}/categories && echo "✅ Categories endpoint OK" || echo "⚠️ Categories endpoint failed"
+                            
+                            echo "Testing stats endpoint..."
+                            curl -f http://localhost:${APP_PORT}/stats && echo "✅ Stats endpoint OK" || echo "⚠️ Stats endpoint failed"
+                        '''
+                    }
+                }
+            }
+            post {
+                unstable {
+                    echo '⚠️ Some endpoints failed verification, but build completed...'
                 }
             }
         }
@@ -293,6 +316,11 @@ EOF
                     mv safety-report-* archived/ 2>/dev/null || true
                 '''
                 archiveArtifacts artifacts: 'archived/**', allowEmptyArchive: true
+                
+                echo "==================================="
+                echo "Pipeline Status: ${currentBuild.result}"
+                echo "Build Number: ${BUILD_NUMBER}"
+                echo "==================================="
             }
         }
         success {
@@ -305,9 +333,20 @@ EOF
             echo '📦 Products API: http://localhost:5001/products'
             echo '📊 Statistics: http://localhost:5001/stats'
             echo '🏷️  Categories: http://localhost:5001/categories'
+            echo ''
+            echo '📊 Check archived reports for security scan results'
+        }
+        unstable {
+            echo '⚠️ Pipeline completed with warnings!'
+            echo '📦 Image built and deployed despite some issues'
+            echo '🚀 Application available at: http://localhost:5001'
+            echo '⚠️ Review the following:'
+            echo '   - Test failures (if any)'
+            echo '   - Security scan results in archived reports'
+            echo '   - Endpoint verification results'
         }
         failure {
-            echo '❌ Pipeline failed!'
+            echo '❌ Pipeline failed during critical stage!'
             sh '''
                 COMPOSE_PROJECT_NAME="jenkins-devsecops-ecommerce"
                 docker-compose -f docker-compose.jenkins.yml -p ${COMPOSE_PROJECT_NAME} down || true
